@@ -1,15 +1,16 @@
 //+------------------------------------------------------------------+
 //|                         GotobiFixingEA.mq5                       |
-//|  Gotobi USDJPY Fixing EA — v0.1                                  |
+//|  Gotobi USDJPY Fixing EA — v0.2                                  |
 //|  Author : Reymondo (Gotobi EA)                                   |
 //|  Desc   : Sells USDJPY at Tokyo fixing window (09:55 JST)        |
 //|           on Gotobi calendar days, exits at entry+25 min.        |
+//|           v0.2: Trailing SL — move to BE at 1:1, then trail.     |
 //|  PRD    : PRD.md v0.1                                            |
 //+------------------------------------------------------------------+
-#property copyright "Reymondo — Gotobi EA v0.1"
+#property copyright "Reymondo — Gotobi EA v0.2"
 #property link      ""
-#property version   "0.10"
-#property description "Gotobi USDJPY Fixing EA — Sells at 09:55 JST on Gotobi days"
+#property version   "0.20"
+#property description "Gotobi USDJPY Fixing EA v0.2 — Trailing SL with BE move at 1:1"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -45,6 +46,12 @@ input double InpSlPercent           = 0.15;   // Stop Loss (% dari harga masuk)
 
 enum ENUM_DAY_MODE { GOTOBI_ONLY = 0, NON_GOTOBI_PLACEBO = 1, ALL_DAYS = 2 };
 input ENUM_DAY_MODE InpDayMode      = GOTOBI_ONLY; // Mode hari trading
+
+//--- Trailing SL
+input group "=== TRAILING SL ==="
+input bool   InpUseTrailSL          = true;   // Aktifkan Trailing SL
+input int    InpBEBufferPoints      = 1;       // Buffer BE di atas entry (points)
+input int    InpTrailStepPoints     = 10;      // Step trail SL (points) setelah BE
 
 //--- Risiko / Risk
 input group "=== RISIKO / RISK ==="
@@ -90,6 +97,11 @@ double g_OpenPrice           = 0;
 double g_MAE                 = 0;   // Maximum Adverse Excursion (in price)
 double g_MFE                 = 0;   // Maximum Favorable Excursion (in price)
 bool   g_HasPosition         = false;
+
+// Trailing SL state
+bool   g_BeReached           = false;  // True setelah SL dipindah ke BE
+double g_CurrentSL           = 0;      // SL aktif saat ini (harga)
+double g_SlDistance          = 0;      // Jarak SL dari entry saat open (in price)
 
 // Retry state for exit
 int    g_ExitRetryCount      = 0;
@@ -355,6 +367,82 @@ bool CloseOurPosition(string reason)
    }
 }
 
+//--- Manage Trailing SL for open SELL position
+void ManageTrailingSL()
+{
+   if(!InpUseTrailSL) return;
+
+   ulong ticket = GetOurPositionTicket();
+   if(ticket == 0 || !PositionSelectByTicket(ticket)) return;
+
+   double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL  = PositionGetDouble(POSITION_SL);
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0) return;
+
+   // Hitung SL distance dari open (diset saat entry, tapi ambil dari posisi jika belum)
+   if(g_SlDistance <= 0)
+      g_SlDistance = MathAbs(currentSL - openPrice);
+   if(g_SlDistance <= 0) return;
+
+   double bePrice    = NormalizeToTickSize(openPrice - InpBEBufferPoints * point); // BE untuk SELL: SL di bawah entry
+   double trailStep  = InpTrailStepPoints * point;
+
+   // === FASE 1: Move to BE saat profit >= 1:1 SL distance ===
+   if(!g_BeReached)
+   {
+      double profitDistance = openPrice - currentBid; // SELL profit = harga turun
+      if(profitDistance >= g_SlDistance)
+      {
+         // Pindah SL ke BE (entry - buffer)
+         if(currentSL > bePrice) // Hanya gerakkan SL ke bawah (untuk SELL = menguntungkan)
+         {
+            g_Trade.PositionModify(ticket, bePrice, 0);
+            if(g_Trade.ResultRetcode() == TRADE_RETCODE_DONE ||
+               g_Trade.ResultRetcode() == TRADE_RETCODE_PLACED)
+            {
+               g_BeReached  = true;
+               g_CurrentSL  = bePrice;
+               LOG_INFO("TRAIL", StringFormat(
+                  "BE reached! SL dipindah ke %.5f (entry=%.5f, profit_dist=%.5f, sl_dist=%.5f)",
+                  bePrice, openPrice, profitDistance, g_SlDistance));
+            }
+            else
+            {
+               LOG_WARN("TRAIL", StringFormat("Gagal pindah SL ke BE: %s [%d]",
+                  g_Trade.ResultComment(), g_Trade.ResultRetcode()));
+            }
+         }
+         else
+         {
+            // SL sudah di BE atau lebih baik
+            g_BeReached = true;
+            g_CurrentSL = currentSL;
+         }
+      }
+      return; // Belum 1:1, jangan trail dulu
+   }
+
+   // === FASE 2: Trail SL mengikuti harga (setelah BE) ===
+   // Untuk SELL: trail SL ke bawah mengikuti penurunan harga
+   double newSL = NormalizeToTickSize(currentBid + trailStep);
+
+   // Hanya pindah SL jika newSL lebih rendah dari SL saat ini (lebih menguntungkan untuk SELL)
+   if(newSL < currentSL - point) // Gunakan 1 point sebagai buffer minimal pergerakan
+   {
+      g_Trade.PositionModify(ticket, newSL, 0);
+      if(g_Trade.ResultRetcode() == TRADE_RETCODE_DONE ||
+         g_Trade.ResultRetcode() == TRADE_RETCODE_PLACED)
+      {
+         LOG_DEBUG("TRAIL", StringFormat(
+            "Trail SL: %.5f → %.5f (bid=%.5f, step=%d pts)",
+            currentSL, newSL, currentBid, InpTrailStepPoints));
+         g_CurrentSL = newSL;
+      }
+   }
+}
+
 //--- Open SELL position — FR-3, FR-3.4
 bool OpenSellPosition()
 {
@@ -436,6 +524,10 @@ bool OpenSellPosition()
       g_MFE         = 0;
       g_HasPosition = true;
       g_TradedToday = true;
+      // Reset trailing SL state
+      g_BeReached   = false;
+      g_CurrentSL   = slPrice;
+      g_SlDistance  = MathAbs(slPrice - g_OpenPrice);
       LogEntry(TimeTradeServer(), g_BrokerGmtOffset, g_OpenPrice, slPrice, rr.lots, rr.riskMoney, spreadPts);
       return true;
    }
@@ -558,19 +650,23 @@ void ProcessLogic()
    }
 
    // -----------------------------------------------------------------------
-   // POSITION MANAGEMENT: Update MAE/MFE, check for SL hit
+   // POSITION MANAGEMENT: Update MAE/MFE, Trailing SL, check for SL hit
    // -----------------------------------------------------------------------
    if(g_HasPosition)
    {
       ulong ticket = GetOurPositionTicket();
       if(ticket == 0)
       {
-         // Position closed externally (SL hit)
-         LOG_INFO("EXIT", "Position closed externally (SL or manual close)");
+         // Position closed externally (SL hit or trailing SL hit)
+         LOG_INFO("EXIT", StringFormat("Position closed externally (SL/TrailSL). BE_reached=%s last_SL=%.5f",
+            g_BeReached ? "YES" : "NO", g_CurrentSL));
          g_HasPosition = false;
          g_OpenPrice   = 0;
          g_MAE         = 0;
          g_MFE         = 0;
+         g_BeReached   = false;
+         g_CurrentSL   = 0;
+         g_SlDistance  = 0;
          g_ExitRetryCount = 0;
          return;
       }
@@ -581,6 +677,9 @@ void ProcessLogic()
       double favorable  = g_OpenPrice - currentBid; // positive = profit for SELL
       if(adverse  > g_MAE) g_MAE = adverse;
       if(favorable > g_MFE) g_MFE = favorable;
+
+      // Trailing SL management
+      ManageTrailingSL();
 
       // -----------------------------------------------------------------------
       // TIME EXIT (FR-6.3)
@@ -643,12 +742,13 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    if(id == CHARTEVENT_CHART_CHANGE)
    {
       Comment(StringFormat(
-         "GotobiEA v0.1\n"
+         "GotobiEA v0.2\n"
          "JST: %s\n"
          "Mode: %s\n"
          "GMT Offset: %+d\n"
          "Traded Today: %s\n"
          "Has Position: %s\n"
+         "Trail SL: %s | BE: %s | SL: %.5f\n"
          "Next Entry: %s\n"
          "Next Exit: %s",
          TimeToString(CurrentJst(), TIME_DATE|TIME_SECONDS),
@@ -656,6 +756,9 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          g_BrokerGmtOffset,
          g_TradedToday ? "YES" : "NO",
          g_HasPosition  ? "YES" : "NO",
+         InpUseTrailSL  ? "ON"  : "OFF",
+         g_BeReached    ? "YES" : "NO",
+         g_CurrentSL,
          TimeToString(g_EntryServerTime, TIME_DATE|TIME_SECONDS),
          TimeToString(g_ExitServerTime,  TIME_DATE|TIME_SECONDS)
       ));
