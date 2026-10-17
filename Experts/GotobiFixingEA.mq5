@@ -51,7 +51,8 @@ input ENUM_DAY_MODE InpDayMode      = GOTOBI_ONLY; // Mode hari trading
 input group "=== TRAILING SL ==="
 input bool   InpUseTrailSL          = true;   // Aktifkan Trailing SL
 input int    InpBEBufferPoints      = 1;       // Buffer BE di atas entry (points)
-input int    InpTrailStepPoints     = 10;      // Step trail SL (points) setelah BE
+input int    InpTrailStepPoints     = 10;      // Kenaikan SL per langkah (points)
+input int    InpTrailTriggerPoints  = 10;      // Trigger: harga harus bergerak X pts dari SL terakhir
 
 //--- Risiko / Risk
 input group "=== RISIKO / RISK ==="
@@ -424,21 +425,32 @@ void ManageTrailingSL()
       return; // Belum 1:1, jangan trail dulu
    }
 
-   // === FASE 2: Trail SL mengikuti harga (setelah BE) ===
-   // Untuk SELL: trail SL ke bawah mengikuti penurunan harga
-   double newSL = NormalizeToTickSize(currentBid + trailStep);
+   // === FASE 2: Trail SL naik bertahap (step-based dengan trigger) ===
+   // Untuk SELL: SL naik (turun nilainya) X pts setelah harga turun Y pts dari SL terakhir
+   double trailTrigger = InpTrailTriggerPoints * point;
+   double trailStep    = InpTrailStepPoints    * point;
 
-   // Hanya pindah SL jika newSL lebih rendah dari SL saat ini (lebih menguntungkan untuk SELL)
-   if(newSL < currentSL - point) // Gunakan 1 point sebagai buffer minimal pergerakan
+   // Harga harus sudah bergerak >= InpTrailTriggerPoints di bawah SL saat ini
+   // Untuk SELL: SL naik = SL price turun; harga turun = bid makin kecil
+   // Trigger terpenuhi jika: currentSL - currentBid >= trailTrigger
+   if(currentSL - currentBid >= trailTrigger)
    {
-      g_Trade.PositionModify(ticket, newSL, 0);
-      if(g_Trade.ResultRetcode() == TRADE_RETCODE_DONE ||
-         g_Trade.ResultRetcode() == TRADE_RETCODE_PLACED)
+      // Naikkan SL sebesar satu step
+      double newSL = NormalizeToTickSize(currentSL - trailStep);
+
+      // Pastikan newSL masih di atas harga saat ini (jangan sampai SL di bawah bid untuk SELL)
+      // dan tidak melampaui harga saat ini
+      if(newSL > currentBid)
       {
-         LOG_DEBUG("TRAIL", StringFormat(
-            "Trail SL: %.5f → %.5f (bid=%.5f, step=%d pts)",
-            currentSL, newSL, currentBid, InpTrailStepPoints));
-         g_CurrentSL = newSL;
+         g_Trade.PositionModify(ticket, newSL, 0);
+         if(g_Trade.ResultRetcode() == TRADE_RETCODE_DONE ||
+            g_Trade.ResultRetcode() == TRADE_RETCODE_PLACED)
+         {
+            LOG_DEBUG("TRAIL", StringFormat(
+               "Trail step: SL %.5f → %.5f (bid=%.5f, trigger=%d pts, step=%d pts)",
+               currentSL, newSL, currentBid, InpTrailTriggerPoints, InpTrailStepPoints));
+            g_CurrentSL = newSL;
+         }
       }
    }
 }
